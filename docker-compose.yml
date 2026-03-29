@@ -1,0 +1,163 @@
+# =============================================================================
+# DGX Spark Multi-Agent Stack
+# Services: Gitea · MLflow · Agent Runner
+# Agents talk to Ollama on the host at host-gateway:11434
+# All code execution happens in throwaway gVisor containers (see tools/)
+# =============================================================================
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+volumes:
+  mlflow-data:
+  gitea-data:
+  gitea-repos:
+  agent-workspace:   # shared volume agents ↔ exec containers
+  agent-cache:       # pip/npm cache across runs
+  agent-venv:        # persistent python site-packages for agents
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Gitea — local Git server (Now using SQLite)
+  gitea:
+    image: gitea/gitea:1.21
+    container_name: agent-gitea
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - ${GITEA_PORT:-3000}:3000   # Web UI + API
+      - ${GITEA_SSH_PORT:-2222}:22     # SSH (optional)
+    environment:
+      USER_UID: 1000
+      USER_GID: 1000
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__database__PATH: /data/gitea/gitea.db
+      GITEA__server__ROOT_URL: http://localhost:${GITEA_PORT:-3000}
+      GITEA__server__SSH_DOMAIN: localhost
+      GITEA__webhook__ALLOWED_HOST_LIST: "*"
+      GITEA__webhook__SKIP_TLS_VERIFY: "true"
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__log__LEVEL: Warn
+    volumes:
+      - gitea-data:/data
+      - gitea-repos:/data/gitea/repositories
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # MLflow — observability
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: agent-mlflow
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts "*"
+      --cors-allowed-origins "*"
+    environment:
+      - MLFLOW_SERVER_ALLOWED_HOSTS=*
+      - MLFLOW_SERVER_CORS_ALLOWED_ORIGINS=*
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+
+  # ---------------------------------------------------------------------------
+  # Exec container image builder (runs once at startup via profile)
+  # Not a running service — just pre-builds the sandboxed images
+  image-builder:
+    image: docker:24-cli
+    container_name: agent-image-builder
+    profiles: ["setup"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker:/build
+    command: >
+      sh -c "
+        docker build -t agent-exec:latest /build/exec &&
+        docker build -t agent-quality:latest /build/quality &&
+        echo 'Images built successfully'
+      "
+
+
+  # ---------------------------------------------------------------------------
+  # Agent Runner — the CrewAI process itself
+  # Mounts workspace volume + Docker socket (to spawn sandboxes)
+  # Talks to Ollama on the HOST (not in Docker)
+  agent-runner:
+    build:
+      context: .
+      dockerfile: docker/runner/Dockerfile
+      args:
+        DOCKER_GID: "${DOCKER_GID:-988}"
+    container_name: agent-runner
+    # do not restart when done -- this is needed to avoid infinite loop
+    restart: no
+    logging: *default-logging
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Ollama
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-coder-next}
+
+      # Gitea
+      GITEA_URL: http://gitea:3000
+      GITEA_TOKEN: ${GITEA_TOKEN}
+      GITEA_USER: ${GITEA_USER:-agent-bot}
+      GITEA_REPO: ${GITEA_REPO:-workspace}
+
+      # MLflow configuration
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-agent-crew}
+
+      # Sandbox config
+      SANDBOX_RUNTIME: ${SANDBOX_RUNTIME:-runsc}   # runsc=gVisor, runc=standard
+      SANDBOX_MEMORY: ${SANDBOX_MEMORY:-4g}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-4}
+      WORKSPACE_VOLUME: agent-workspace
+      RESOURCES_VOLUME: agent-venv
+
+      # Python
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      # WANTED_UID/WANTED_GID
+      WANTED_UID: ${WANTED_UID:-1000}
+      WANTED_GID: ${WANTED_GID:-1000}
+      DOCKER_GID: ${DOCKER_GID}
+    volumes:
+      - agent-workspace:/workspace
+      - agent-cache:/root/.cache
+      - agent-venv:/home/agent/.local
+      - /var/run/docker.sock:/var/run/docker.sock  # spawn sandbox containers
+      - .:/app:ro                                   # mount code read-only
+      - ./workspace/code:/workspace-copy
+      - ./workspace/progress:/workspace-progress
+      - /etc/localtime:/etc/localtime:ro
+    working_dir: /workspace
+    command: python /app/crew.py
+    depends_on:
+      gitea:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy

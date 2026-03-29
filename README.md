@@ -81,6 +81,7 @@ make setup
 
 # Modify the CrewAI-multiagent_tasks.md file with the feature request
 ...
+# an example one if provided
 
 # Run the crew on a feature
 make up

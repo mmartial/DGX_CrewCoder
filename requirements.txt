@@ -1,0 +1,14 @@
+crewai[litellm]
+crewai-tools
+langchain-openai
+langchain-community
+docker
+gitpython
+pygitea
+mlflow
+langchain
+pydantic
+rich
+python-dotenv
+httpx
+tenacity

@@ -50,6 +50,11 @@ DGX Spark (Ollama :11434)
   Gitea (PRs) + MLflow (traces)
 ```
 
+Note: 
+- `agent-runner` mounts `/var/run/docker.sock` to spawn sandbox containers. This grants the agent container full Docker daemon access — it can launch privileged containers, read other containers' filesystems, or escape to the host. This is a trade-off for DGX single-user use.
+- The tool is not designed to work without MLflow as an observability tool
+- The container mounts the folder this `README.md` is in as `/app`. This allows us the ability to edit the code and see the changes reflected in the container (after a `make down` and `make up`) 
+
 ## Prerequisites
 
 - Docker with gVisor runtime (`make gvisor-install`)
@@ -74,6 +79,7 @@ make gvisor-test
 # Populate your .env
 make dotenv
 # Adapt your .env file to your preferences
+# Security consideration: It is recommeneded to change the default password for Gitea
 # Edit the RALPH_LOOP in particular to run it as many times as you want
 
 # Build sandbox images and start services

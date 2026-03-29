@@ -79,6 +79,7 @@ if os.getenv("MLFLOW_TRACKING_URI"):
     except Exception as e:
         rprint(f"[yellow]⚠ MLflow unavailable: {e}[/yellow]")
 else:
+    # The tool is not designed to work without MLflow as an observability tool
     rprint("[yellow]⚠ MLflow not configured (missing MLFLOW_TRACKING_URI)[/yellow]")
     exit(1)
 
@@ -361,19 +362,19 @@ def step_callback(step):
             # Copy trace to workspace-progress as WANTED_UID and WANTED_GID
             rprint(f"[cyan]Copy trace to {workspace_progress}...[/cyan]")
             cmd = ["rsync", "-av", f"--chown={uid}:{gid}", trace_path, f"{workspace_progress}/"]
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, timeout=120)
 
     # Copy code from workspace to workspace-copy as WANTED_UID and WANTED_GID
     rprint(f"[cyan]Copy code from {workspace_path} to {workspace_copy}...[/cyan]")
-    cmd = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__"]
-    subprocess.run(cmd, check=True)
+    cmd = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
+    subprocess.run(cmd, check=True, timeout=120)
 
     # Copy log file to workspace-progress as WANTED_UID and WANTED_GID
     log_file = f"/tmp/crew_execution_loop_{loop_index}.log"
     if os.path.exists(log_file):
         rprint(f"[cyan]Copy log file to {workspace_progress}...[/cyan]")
         cmd = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, timeout=120)
 
 
 # Run
@@ -451,15 +452,15 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
 
         # Copy code from workspace to workspace-copy as WANTED_UID and WANTED_GID
         rprint(f"[cyan]Copy code from {workspace_path} to {workspace_copy}...[/cyan]")
-        cmd = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__"]
-        subprocess.run(cmd, check=True)
+        cmd = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
+        subprocess.run(cmd, check=True, timeout=120)
 
         # Copy log file to workspace-progress as WANTED_UID and WANTED_GID
         log_file = f"/tmp/crew_execution_loop_{loop_index}_task_{i}.log"
         if os.path.exists(log_file):
             rprint(f"[cyan]Copy log file to {workspace_progress}...[/cyan]")
             cmd = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, timeout=120)
 
 
     mlflow.log_metric("loop_complete", 1)
@@ -501,7 +502,7 @@ if __name__ == "__main__":
     local_gid = os.getgid()
     # Copy workspace-copy to workspace to initialize it
     cmd = ["rsync", "-av", f"--chown={local_uid}:{local_gid}", workspace_copy+"/", workspace_path+"/"]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=120)
 
     # Change to workspace path, DO NOT USE any other path for content to work from
     os.chdir(workspace_path)
@@ -524,10 +525,10 @@ if __name__ == "__main__":
     # 3. Exit with success code
     rprint("[green]All loops completed successfully.[/green]")
     # Copy a  "COMPLETED" file to workspace_copy (the location OUTSIDE of the container)
-    with open(f"/tmp/COMPLETED", "w", encoding="utf-8") as f:
+    with open("/tmp/COMPLETED", "w", encoding="utf-8") as f:
         f.write("All loops completed successfully.")
     # Copy the completed file to workspace_copy
     cmd = ["rsync", "-av", f"--chown={uid}:{gid}", "/tmp/COMPLETED", f"{workspace_copy}/"]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=120)
 
     exit(0)

@@ -48,7 +48,7 @@ def _make_llm(temperature: float = 0.1) -> LLM:
         base_url=base_url,
         api_key="ollama", # required for ollama provider in LiteLLM
         temperature=temperature,
-        timeout=900,
+        timeout=1500,
         extra_body={"num_ctx": num_ctx},
     )
 
@@ -107,7 +107,7 @@ senior_developer = Agent(
     llm=_llm,
     tools=[write_file, read_file, list_files, run_python, run_shell, run_tests, git_commit, sync_dependencies],
     verbose=True,
-    max_iter=25,
+    max_iter=15,
     max_execution_time=14400,
     allow_delegation=False,
 )

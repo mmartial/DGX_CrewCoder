@@ -459,9 +459,16 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
                 
                 with mlflow.start_span(name=f"Crew Kickoff: {task.agent.role} (att {attempt})") as span:
                     span.set_attribute("task", task.description)
-                    result = task_crew.kickoff()
-                
-                last_result = result.raw
+                    try:
+                        result = task_crew.kickoff()
+                        last_result = result.raw
+                    except Exception as e:
+                        rprint(f"[bold red]⚠ Exception during Task {i+1} ({task.agent.role}):[/bold red] {e}")
+                        last_result = f"EXCEPTION during execution: {str(e)}"
+                        # Create a mock result object to satisfy the rest of the loop
+                        from unittest.mock import MagicMock
+                        result = MagicMock()
+                        result.raw = last_result
                 
                 # --- Synchronize State (Code + Logs) ---
                 rprint(f"[cyan]Copying latest state to host...[/cyan]")

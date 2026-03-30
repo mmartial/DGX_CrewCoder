@@ -22,6 +22,29 @@ volumes:
 services:
 
   # ---------------------------------------------------------------------------
+  # Docker socket proxy — safe Docker API access for agents
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy
+    container_name: agent-docker-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      POST: 1
+      VOLUMES: 1
+      NETWORKS: 1
+      # Everything else defaults to 0 (blocked)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-proxy-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:2375/version"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
   # Gitea — local Git server (Now using SQLite)
   gitea:
     image: gitea/gitea:1.21
@@ -144,12 +167,14 @@ services:
       # WANTED_UID/WANTED_GID
       WANTED_UID: ${WANTED_UID:-1000}
       WANTED_GID: ${WANTED_GID:-1000}
-      DOCKER_GID: ${DOCKER_GID}
+      DOCKER_GID: ${DOCKER_GID:-988}
+
+      # Tell the Docker SDK to use the proxy instead of the real socket
+      DOCKER_HOST: tcp://docker-proxy:2375      
     volumes:
       - agent-workspace:/workspace
       - agent-cache:/root/.cache
       - agent-venv:/home/agent/.local
-      - /var/run/docker.sock:/var/run/docker.sock  # spawn sandbox containers
       - .:/app:ro                                   # mount code read-only
       - ./workspace/code:/workspace-copy
       - ./workspace/progress:/workspace-progress
@@ -161,3 +186,12 @@ services:
         condition: service_healthy
       mlflow:
         condition: service_healthy
+      docker-proxy:
+        condition: service_healthy
+    networks:
+      - default
+      - docker-proxy-net
+
+networks:
+  docker-proxy-net:
+    driver: bridge

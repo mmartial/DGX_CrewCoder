@@ -129,7 +129,7 @@ Order of execution in `crew.py` (`build_tasks` function).
 |---|---|---|
 | Tech PM | Decomposes features into tasks | read_file, write_file |
 | Senior Developer | Implements code with TDD (tests first, never leave TODO comments) | write_file, run_tests, git_commit |
-| Test Engineer | Ensures ≥95% coverage | run_tests, write_file |
+| Test Engineer | Ensures ≥95% coverage and can make small code fixes to unlock it | run_tests, write_file |
 | Security Auditor | Semgrep + Trivy + secrets scan | run_quality_gate |
 | Security Review | Vulnerability review | git_diff, add_pr_review |
 | Code Reviewer | BASSPC framework review | git_diff, add_pr_review |

@@ -13,12 +13,15 @@ import os
 import uuid
 import tempfile
 import textwrap
+import time
+import random
 from pathlib import Path
 from typing import Literal
+from functools import wraps
 
 import docker
 from crewai.tools import tool
-from docker.errors import ContainerError, ImageNotFound
+from docker.errors import ContainerError, ImageNotFound, APIError, NotFound
 from tools.logging_utils import rprint
 
 
@@ -33,8 +36,101 @@ WORKSPACE_VOL   = os.getenv("WORKSPACE_VOLUME", "agent-workspace")
 RESOURCES_VOL   = os.getenv("RESOURCES_VOLUME", "agent-venv")
 TIMEOUT_SECONDS = 120
 
+# Retry configuration
+MAX_RETRIES = int(os.getenv("DOCKER_MAX_RETRIES", "3"))
+INITIAL_BACKOFF = float(os.getenv("DOCKER_INITIAL_BACKOFF", "1.0"))
+MAX_BACKOFF = float(os.getenv("DOCKER_MAX_BACKOFF", "30.0"))
+JITTER = float(os.getenv("DOCKER_JITTER", "0.1"))  # 10% jitter
+
 _client = docker.from_env()
 
+
+# ============================================================================
+# Custom Exception Classes
+# ============================================================================
+
+class DockerTimeoutError(Exception):
+    """Raised when a Docker operation times out."""
+    pass
+
+class DockerImageNotFoundError(Exception):
+    """Raised when a Docker image is not found."""
+    pass
+
+class DockerAPIError(Exception):
+    """Raised when Docker API encounters an error."""
+    pass
+
+class GitConflictError(Exception):
+    """Raised when Git encounters a merge conflict."""
+    pass
+
+class GitAuthenticationError(Exception):
+    """Raised when Git authentication fails."""
+    pass
+
+class NetworkError(Exception):
+    """Raised when network operations fail."""
+    pass
+
+
+# ============================================================================
+# Retry with Exponential Backoff and Jitter
+# ============================================================================
+
+def retry_with_backoff(
+    max_retries: int = MAX_RETRIES,
+    initial_backoff: float = INITIAL_BACKOFF,
+    max_backoff: float = MAX_BACKOFF,
+    jitter: float = JITTER,
+    retryable_exceptions: tuple = (DockerTimeoutError, NetworkError, APIError),
+):
+    """
+    Decorator for retrying operations with exponential backoff and jitter.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_backoff: Initial delay in seconds
+        max_backoff: Maximum delay in seconds
+        jitter: Random jitter factor (0-1)
+        retryable_exceptions: Tuple of exceptions that trigger retry
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            backoff = initial_backoff
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except retryable_exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        # Calculate delay with jitter
+                        delay = backoff * (1 + random.uniform(-jitter, jitter))
+                        rprint(f"[yellow]⚠ Retry {attempt + 1}/{max_retries} after {delay:.2f}s delay...[/yellow]")
+                        time.sleep(delay)
+                        # Exponential backoff with cap
+                        backoff = min(backoff * 2, max_backoff)
+                    else:
+                        rprint(f"[bold red]❌ Max retries ({max_retries}) exceeded[/bold red]")
+                        raise
+                except Exception as e:
+                    # Non-retryable exception - fail immediately
+                    last_exception = e
+                    raise
+            
+            # Should not reach here, but just in case
+            if last_exception:
+                raise last_exception
+        return wrapper
+    return decorator
+
+
+# ============================================================================
+# Docker Error Handling
+# ============================================================================
 
 def _run_container(
     image: str,
@@ -72,24 +168,54 @@ def _run_container(
     )
 
     rprint(f"[yellow]🚀 Starting container: {image} (job:{job_id})[/yellow]")
+    
+    # Retry with exponential backoff for Docker operations
+    @retry_with_backoff(
+        max_retries=MAX_RETRIES,
+        initial_backoff=INITIAL_BACKOFF,
+        max_backoff=MAX_BACKOFF,
+        jitter=JITTER,
+        retryable_exceptions=(APIError, DockerTimeoutError, NetworkError)
+    )
+    def _run_with_retry():
+        try:
+            output = _client.containers.run(**kwargs)
+            return {
+                "success": True,
+                "output": output.decode(errors="replace"),
+                "job_id": job_id,
+            }
+        except ContainerError as e:
+            error_output = e.stderr.decode(errors="replace") if e.stderr else str(e)
+            # Check for specific error types
+            if "timeout" in error_output.lower():
+                raise DockerTimeoutError(f"Container timeout: {error_output}")
+            return {
+                "success": False,
+                "output": error_output,
+                "exit_code": e.exit_status,
+                "job_id": job_id,
+            }
+        except ImageNotFound:
+            raise DockerImageNotFoundError(f"Image '{image}' not found")
+        except NotFound:
+            raise DockerImageNotFoundError(f"Resource not found: {image}")
+        except APIError as e:
+            raise DockerAPIError(f"Docker API error: {e}")
+        except Exception as e:
+            # Check if it's a network-related error
+            error_str = str(e)
+            if "network" in error_str.lower() or "connection" in error_str.lower():
+                raise NetworkError(f"Network error: {e}")
+            raise
+    
     try:
-        output = _client.containers.run(**kwargs)
-        return {
-            "success": True,
-            "output": output.decode(errors="replace"),
-            "job_id": job_id,
-        }
-    except ContainerError as e:
+        return _run_with_retry()
+    except (DockerTimeoutError, DockerImageNotFoundError, DockerAPIError, NetworkError) as e:
         return {
             "success": False,
-            "output": e.stderr.decode(errors="replace") if e.stderr else str(e),
-            "exit_code": e.exit_status,
-            "job_id": job_id,
-        }
-    except ImageNotFound:
-        return {
-            "success": False,
-            "output": f"Image '{image}' not found. Run: docker build -t {image} docker/exec/",
+            "output": str(e),
+            "exit_code": -1,
             "job_id": job_id,
         }
     except Exception as e:  # noqa: BLE001
@@ -300,4 +426,16 @@ def _format_result(result: dict) -> str:
     agent = os.getenv("CREWAI_CURRENT_AGENT", "Unknown")
     
     prefix = f"[{status} Agent: {agent} | job:{job}]"
-    return f"{prefix}\n{out}" if out else f"{prefix} (no output)"
+    
+    # Tool Output Optimization: Truncate long outputs with summary
+    MAX_OUTPUT_LENGTH = int(os.getenv("MAX_TOOL_OUTPUT_LENGTH", "1000"))
+    
+    if len(out) <= MAX_OUTPUT_LENGTH:
+        return f"{prefix}\n{out}" if out else f"{prefix} (no output)"
+    
+    # Truncate with summary
+    first_500 = out[:500]
+    last_500 = out[-500:]
+    summary = f"[Output truncated: {len(out)} chars total. Showing first 500 + last 500 chars.]"
+    
+    return f"{prefix}\n{first_500}\n\n... (truncated) ...\n\n{last_500}\n\n{summary}"

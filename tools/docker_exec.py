@@ -266,16 +266,16 @@ def sync_dependencies() -> str:
 
 
 @tool("Run pytest in sandbox")
-def run_tests(test_path: str = ".", extra_args: str = "--tb=short -q") -> str:
+def run_tests(test_path: str = ".", extra_args: str = "--tb=short -q --cov=. --cov-report=term-missing") -> str:
     """
     Run the test suite with pytest inside the sandbox.
     Returns pass/fail counts and any failure details.
 
     Args:
         test_path: path relative to /workspace (default: whole project)
-        extra_args: additional pytest flags
+        extra_args: additional pytest flags (coverage flags included by default)
     """
-    cmd = f"python -m pytest {test_path} {extra_args} --cov=. --cov-report=term-missing"
+    cmd = f"python -m pytest {test_path} {extra_args}"
     result = _run_container(SANDBOX_IMAGE, cmd)
     return _format_result(result)
 

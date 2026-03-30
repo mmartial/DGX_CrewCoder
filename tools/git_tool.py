@@ -8,14 +8,17 @@ Agents commit code, open PRs, and request reviews — just like the slide shows.
 from __future__ import annotations
 
 import os
+import time
+import random
 from pathlib import Path
 from datetime import datetime
 
 import httpx
 from crewai.tools import tool
-from git import Repo, InvalidGitRepositoryError
+from git import Repo, InvalidGitRepositoryError, GitCommandError, GitCommandNotFound
 import functools
 
+# Config
 GITEA_URL   = os.getenv("GITEA_URL", "http://localhost:3000")
 GITEA_TOKEN = os.getenv("GITEA_TOKEN", "")
 GITEA_USER  = os.getenv("GITEA_USER", "agent-bot")
@@ -26,6 +29,116 @@ _headers = {
     "Authorization": f"token {GITEA_TOKEN}",
     "Content-Type": "application/json",
 }
+
+# Retry configuration
+GIT_MAX_RETRIES = int(os.getenv("GIT_MAX_RETRIES", "3"))
+GIT_INITIAL_BACKOFF = float(os.getenv("GIT_INITIAL_BACKOFF", "1.0"))
+GIT_MAX_BACKOFF = float(os.getenv("GIT_MAX_BACKOFF", "30.0"))
+GIT_JITTER = float(os.getenv("GIT_JITTER", "0.1"))  # 10% jitter
+
+
+# ============================================================================
+# Custom Git Exception Classes
+# ============================================================================
+
+class GitConflictError(Exception):
+    """Raised when Git encounters a merge conflict."""
+    pass
+
+class GitAuthenticationError(Exception):
+    """Raised when Git authentication fails."""
+    pass
+
+class GitNetworkError(Exception):
+    """Raised when Git network operations fail."""
+    pass
+
+class GitRepositoryError(Exception):
+    """Raised when Git repository operations fail."""
+    pass
+
+
+# ============================================================================
+# Retry with Exponential Backoff and Jitter for Git Operations
+# ============================================================================
+
+def retry_git_operation(
+    max_retries: int = GIT_MAX_RETRIES,
+    initial_backoff: float = GIT_INITIAL_BACKOFF,
+    max_backoff: float = GIT_MAX_BACKOFF,
+    jitter: float = GIT_JITTER,
+):
+    """
+    Decorator for retrying Git operations with exponential backoff and jitter.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_backoff: Initial delay in seconds
+        max_backoff: Maximum delay in seconds
+        jitter: Random jitter factor (0-1)
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            backoff = initial_backoff
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (GitNetworkError, GitConflictError) as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        # Calculate delay with jitter
+                        delay = backoff * (1 + random.uniform(-jitter, jitter))
+                        rprint(f"[yellow]⚠ Git retry {attempt + 1}/{max_retries} after {delay:.2f}s delay...[/yellow]")
+                        time.sleep(delay)
+                        # Exponential backoff with cap
+                        backoff = min(backoff * 2, max_backoff)
+                    else:
+                        rprint(f"[bold red]❌ Git max retries ({max_retries}) exceeded[/bold red]")
+                        raise
+                except Exception as e:
+                    # Non-retryable exception - fail immediately
+                    last_exception = e
+                    raise
+            
+            if last_exception:
+                raise last_exception
+        return wrapper
+    return decorator
+
+
+# ============================================================================
+# Git Error Handling Helpers
+# ============================================================================
+
+def _handle_git_error(func):
+    """Decorator to handle Git errors with specific exception types."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except GitCommandError as e:
+            error_output = str(e).lower()
+            
+            # Check for merge conflicts
+            if "conflict" in error_output or "merge conflict" in error_output:
+                raise GitConflictError(f"Git merge conflict: {e}")
+            
+            # Check for authentication errors
+            if "authentication" in error_output or "permission denied" in error_output:
+                raise GitAuthenticationError(f"Git authentication error: {e}")
+            
+            # Check for network errors
+            if "network" in error_output or "connection" in error_output:
+                raise GitNetworkError(f"Git network error: {e}")
+            
+            # Default to repository error
+            raise GitRepositoryError(f"Git command error: {e}")
+        except GitCommandNotFound as e:
+            raise GitRepositoryError(f"Git command not found: {e}")
+    return wrapper
 
 @functools.lru_cache(maxsize=1)
 def get_gitea_username() -> str:
@@ -122,6 +235,16 @@ def sync_workspace() -> str:
         repo.git.add("-A")
         try:
             repo.git.commit("-m", "automation: sync point before pull")
+        except GitConflictError as e:
+            print(f"-- Sync Warning: Merge conflict during commit: {e}")
+            # Try to resolve by aborting and continuing
+            try:
+                repo.git.merge("--abort")
+            except Exception:
+                pass
+        except GitAuthenticationError as e:
+            print(f"-- Sync Error: Authentication failure: {e}")
+            raise
         except Exception as e:
             print(f"-- Sync Warning: Could not commit local changes: {e}")
 
@@ -144,6 +267,17 @@ def sync_workspace() -> str:
         try:
             # Use --no-rebase to avoid complicated states, but handle failures
             repo.git.pull("origin", "main", "--no-rebase")
+        except GitConflictError as e:
+            print(f"-- Sync CRITICAL: Merge conflicts detected! Attempting to abort...")
+            repo.git.merge("--abort")
+            raise GitConflictError(f"Merge conflict during sync: {e}")
+        except GitAuthenticationError as e:
+            print(f"-- Sync Error: Authentication failure during pull: {e}")
+            raise
+        except GitNetworkError as e:
+            print(f"-- Sync Warning: Network error during pull: {e}. Retrying...")
+            # Will be handled by retry decorator if used
+            raise
         except Exception as e:
             print(f"-- Sync Warning: Pull failed: {e}. Checking for conflicts...")
             if repo.git.execute(["git", "ls-files", "-u"]):
@@ -152,6 +286,8 @@ def sync_workspace() -> str:
             else:
                 print("-- Sync: Pull failed but no conflicts detected (maybe already up to date or unrelated history).")
 
+    except (GitConflictError, GitAuthenticationError, GitNetworkError):
+        raise
     except Exception as e:
         print(f"Warning: Could not sync with Gitea main: {e}")
     
@@ -192,6 +328,7 @@ def git_commit(message: str, branch: str | None = None) -> str:
     """
     Stage all changes in /workspace and create a commit.
     If branch is provided, creates and checks out that branch first.
+    Uses git commit -a for faster commits by skipping the staging area.
 
     Args:
         message: commit message (use conventional commits: feat:, fix:, test:)
@@ -210,20 +347,43 @@ def git_commit(message: str, branch: str | None = None) -> str:
         else:
             repo.git.checkout(branch)
 
-    repo.git.add("-A")
+    # Use git commit -a for faster commits (auto-stages tracked files)
     try:
+        # First add any new files, then commit all changes
+        repo.git.add("-A")
         commit = repo.index.commit(message)
         branches = [b.name for b in repo.branches]
         return f"{prefix} SUCCESS: Committed {commit.hexsha[:8]} on branch '{repo.active_branch.name}'. All branches: {branches}"
+    except GitConflictError as e:
+        return f"{prefix} ERROR: Merge conflict - {e}"
+    except GitAuthenticationError as e:
+        return f"{prefix} ERROR: Authentication failure - {e}"
+    except GitRepositoryError as e:
+        return f"{prefix} ERROR: Repository error - {e}"
     except Exception as e:
         return f"{prefix} ERROR committing: {e}. Are there any changes to commit? Use list_files() to check."
 
 
 @tool("Git push to Gitea")
+@retry_git_operation(
+    max_retries=GIT_MAX_RETRIES,
+    initial_backoff=GIT_INITIAL_BACKOFF,
+    max_backoff=GIT_MAX_BACKOFF,
+    jitter=GIT_JITTER
+)
 def git_push(branch: str | None = None) -> str:
     """
     Push the current branch (or named branch) to the Gitea remote.
     Adds the remote automatically if not configured.
+    Uses exponential backoff with jitter for network resilience.
+    
+    Args:
+        branch: branch to push (default: current branch)
+        
+    Raises:
+        GitAuthenticationError: If authentication fails
+        GitNetworkError: If network operations fail
+        GitConflictError: If push is rejected due to conflicts
     """
     agent = os.getenv("CREWAI_CURRENT_AGENT", "Unknown")
     prefix = f"[Agent: {agent}]"
@@ -235,6 +395,10 @@ def git_push(branch: str | None = None) -> str:
         if e.response.status_code == 404:
             # Create it
             _api("POST", f"/user/repos", json={"name": GITEA_REPO, "private": False})
+        else:
+            raise GitNetworkError(f"Failed to check repo existence: {e}")
+    except httpx.RequestError as e:
+        raise GitNetworkError(f"Network error checking repo: {e}")
 
     repo = _repo()
     branch = branch or repo.active_branch.name
@@ -249,8 +413,19 @@ def git_push(branch: str | None = None) -> str:
     else:
         repo.remotes.origin.set_url(remote_url)
 
-    repo.git.push("origin", branch, "--set-upstream", "--force-with-lease")
-    return f"{prefix} Pushed branch '{branch}' to {GITEA_URL}/{username}/{GITEA_REPO}.git"
+    try:
+        repo.git.push("origin", branch, "--set-upstream", "--force-with-lease")
+        return f"{prefix} Pushed branch '{branch}' to {GITEA_URL}/{username}/{GITEA_REPO}.git"
+    except GitCommandError as e:
+        error_str = str(e).lower()
+        if "rejected" in error_str or "non-fast-forward" in error_str:
+            raise GitConflictError(f"Push rejected - branch may have diverged: {e}")
+        elif "authentication" in error_str or "permission" in error_str:
+            raise GitAuthenticationError(f"Push authentication failed: {e}")
+        elif "network" in error_str or "connection" in error_str:
+            raise GitNetworkError(f"Network error during push: {e}")
+        else:
+            raise GitRepositoryError(f"Git push error: {e}")
 
 
 @tool("Open a pull request on Gitea")
@@ -402,3 +577,140 @@ def git_diff(base: str = "main", head: str | None = None) -> str:
     if len(full) > 8000:
         full = full[:8000] + "\n... (truncated, use read_file for full content)"
     return f"{prefix} === STAT ===\n{diff}\n\n=== DIFF ===\n{full}"
+
+
+# ============================================================================
+# Branch Management Optimizations
+# ============================================================================
+
+def get_branch_prefix() -> str:
+    """Get the branch prefix for agent branches."""
+    return os.getenv("AGENT_BRANCH_PREFIX", "agent/")
+
+def find_existing_branch_for_feature(feature_request: str) -> str | None:
+    """
+    Find an existing branch for a similar feature request to enable branch reuse.
+    Uses simple string matching on feature keywords.
+    
+    Args:
+        feature_request: The feature request to search for
+        
+    Returns:
+        Branch name if found, None otherwise
+    """
+    repo = _repo()
+    prefix = get_branch_prefix()
+    
+    # Extract keywords from feature request
+    keywords = [w.lower() for w in feature_request.split() if len(w) > 3]
+    
+    for branch in repo.branches:
+        branch_name = branch.name
+        if not branch_name.startswith(prefix):
+            continue
+            
+        # Check if branch name or recent commits mention similar keywords
+        branch_keywords = [w.lower() for w in branch_name.split() if len(w) > 3]
+        matching_keywords = len(set(keywords) & set(branch_keywords))
+        
+        if matching_keywords >= 2:  # At least 2 matching keywords
+            return branch_name
+    
+    return None
+
+def cleanup_merged_branches() -> str:
+    """
+    Clean up merged branches to keep git history clean.
+    Removes local and remote branches that have been merged.
+    
+    Returns:
+        Summary of cleanup actions
+    """
+    repo = _repo()
+    prefix = get_branch_prefix()
+    cleaned = []
+    
+    # Get current branch
+    current_branch = repo.active_branch.name
+    
+    # Clean up local merged branches
+    try:
+        merged_branches = repo.git.branch("--merged", current_branch).splitlines()
+        for branch in merged_branches:
+            branch = branch.strip()
+            if branch.startswith(prefix) and branch != current_branch:
+                try:
+                    repo.git.branch("-d", branch)
+                    cleaned.append(f"Local: {branch}")
+                except Exception:  # noqa: BLE001
+                    # Branch might not be fully merged, skip
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+    
+    # Clean up remote merged branches
+    try:
+        repo.remotes.origin.fetch(prune=True)
+        # Note: Gitea doesn't support --merged for remote branches easily
+        # We'll just list them for manual cleanup
+        remote_branches = [b.name for b in repo.remotes.origin.refs]
+        for branch in remote_branches:
+            if branch.startswith(prefix):
+                # Check if locally merged
+                local_branch_name = branch.replace("origin/", "")
+                if local_branch_name in [b.name for b in repo.branches]:
+                    local_branch = repo.branches[local_branch_name]
+                    if local_branch.is_merged_to(current_branch):
+                        cleaned.append(f"Remote: {branch} (marked for cleanup)")
+    except Exception:  # noqa: BLE001
+        pass
+    
+    if cleaned:
+        return f"Cleaned up merged branches:\n" + "\n".join(f"  - {b}" for b in cleaned)
+    return "No merged branches to clean up"
+
+def create_optimized_branch_name(feature_request: str, loop_index: int) -> str:
+    """
+    Create an optimized branch name that enables reuse.
+    Uses a hash of the feature request to identify similar features.
+    
+    Args:
+        feature_request: The feature request
+        loop_index: Current loop index
+        
+    Returns:
+        Optimized branch name
+    """
+    import hashlib
+    
+    # Create a hash-based identifier for the feature
+    feature_hash = hashlib.md5(feature_request.encode()).hexdigest()[:8]
+    
+    # Extract key words for readability
+    keywords = [w.lower() for w in feature_request.split() if len(w) > 3][:3]
+    keyword_part = "-".join(keywords) if keywords else "feature"
+    
+    # Format: agent/{keyword}-{hash}-loop{loop_index}
+    branch_name = f"{get_branch_prefix()}{keyword_part}-{feature_hash}-loop{loop_index}"
+    
+    return branch_name
+
+def get_branch_stats() -> dict:
+    """
+    Get statistics about branches for monitoring.
+    
+    Returns:
+        Dictionary with branch statistics
+    """
+    repo = _repo()
+    prefix = get_branch_prefix()
+    
+    all_branches = [b.name for b in repo.branches]
+    agent_branches = [b for b in all_branches if b.startswith(prefix)]
+    
+    return {
+        "total_branches": len(all_branches),
+        "agent_branches": len(agent_branches),
+        "current_branch": repo.active_branch.name,
+        "agent_branch_prefix": prefix,
+    }

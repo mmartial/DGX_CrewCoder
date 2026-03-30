@@ -422,64 +422,88 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
     for i, task in enumerate(tasks):
         rprint(f"[bold cyan]>>> Executing Task {i+1}/{len(tasks)}: {task.agent.role}[/bold cyan]")
         
-        with mlflow.start_run(run_name=f"loop-{loop_index}-{timestamp}--task-{i+1}-{task.agent.role}"):
-            mlflow.set_tag("agent", task.agent.role)
-            os.environ["CREWAI_CURRENT_AGENT"] = task.agent.role
-            mlflow.log_params({
-                "feature_request": feature_request,
-                "loop_index": loop_index,
-                "branch_name": branch_name,
-                "model": os.getenv('OLLAMA_MODEL', 'qwen3-coder-next')
-            })
-            # Each task gets a focused Crew instance to trigger a separate MLflow trace
-            task_crew = Crew(
-                agents=[task.agent],
-                tasks=[task],
-                process=Process.sequential,
-                verbose=True,
-                memory=False,
-                max_rpm=60,
-                share_crew=False,
-                step_callback=step_callback, # Use module-level function
-                output_log_file=f"/tmp/crew_execution_loop_{loop_index}_task_{i}.log",
-                max_execution_time=14400 # 4 hours to match agent limit
-            )
-            
-            # Kickoff task-specific trace
-            with mlflow.start_span(name=f"Crew Kickoff: {task.agent.role}") as span:
-                span.set_attribute("task", task.description)
-                result = task_crew.kickoff()
-            results.append(result)
+        max_retries = int(os.getenv("TASK_RETRIES", "2"))
+        last_result = None
+        
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                rprint(f"[yellow]🔁 Retrying Task {i+1} (Attempt {attempt}/{max_retries})...[/yellow]")
+                # Inject failure context into task description for the retry
+                original_description = task.description
+                failure_context = f"\n\n[RETRY CONTEXT] Your previous attempt FAILED with the following output:\n---\n{last_result}\n---\nPlease analyze the error and try again. Ensure all requested files are written and verified."
+                task.description = original_description + failure_context
 
-            # --- Synchronize State (Code + Logs) ---
-            # We do this after every task regardless of success/failure
-            rprint(f"[cyan]Copying latest state to host...[/cyan]")
-            
-            # Code
-            cmd_code = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
-            subprocess.run(cmd_code, check=True, timeout=120)
-            
-            # Logs
-            log_file = f"/tmp/crew_execution_loop_{loop_index}_task_{i}.log"
-            if os.path.exists(log_file):
-                cmd_log = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
-                subprocess.run(cmd_log, check=True, timeout=120)
+            with mlflow.start_run(run_name=f"loop-{loop_index}-{timestamp}--task-{i+1}-{task.agent.role}-att-{attempt}"):
+                mlflow.set_tag("agent", task.agent.role)
+                mlflow.set_tag("attempt", attempt)
+                os.environ["CREWAI_CURRENT_AGENT"] = task.agent.role
+                mlflow.log_params({
+                    "feature_request": feature_request,
+                    "loop_index": loop_index,
+                    "branch_name": branch_name,
+                    "attempt": attempt
+                })
 
-            # --- Failure Gate ---
-            # We only trigger a terminal loop failure if the agent explicitly 
-            # starts its final answer with a failure prefix.
-            clean_result = result.raw.strip().upper()
-            if clean_result.startswith(("FAILED", "ERROR")):
-                rprint(f"\n[bold red]✖ Task {i+1} ({task.agent.role}) FAILED![/bold red]")
-                rprint(Panel(
-                    result.raw,
-                    title=f"[bold red]Failure Summary: {task.agent.role}[/bold red]",
-                    border_style="red",
-                ))
-                rprint(f"[red]Stopping pipeline execution for this feature loop.[/red]\n")
-                mlflow.log_metric(f"task_{i+1}_failed", 1)
-                failure_occurred = True
-                break
+                task_crew = Crew(
+                    agents=[task.agent],
+                    tasks=[task],
+                    process=Process.sequential,
+                    verbose=True,
+                    memory=False,
+                    max_rpm=60,
+                    share_crew=False,
+                    step_callback=step_callback,
+                    output_log_file=f"/tmp/crew_execution_loop_{loop_index}_task_{i}_att_{attempt}.log",
+                    max_execution_time=14400
+                )
+                
+                with mlflow.start_span(name=f"Crew Kickoff: {task.agent.role} (att {attempt})") as span:
+                    span.set_attribute("task", task.description)
+                    result = task_crew.kickoff()
+                
+                last_result = result.raw
+                
+                # --- Synchronize State (Code + Logs) ---
+                rprint(f"[cyan]Copying latest state to host...[/cyan]")
+                cmd_code = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
+                subprocess.run(cmd_code, check=True, timeout=120)
+                
+                log_file = f"/tmp/crew_execution_loop_{loop_index}_task_{i}_att_{attempt}.log"
+                if os.path.exists(log_file):
+                    cmd_log = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
+                    subprocess.run(cmd_log, check=True, timeout=120)
+
+                # --- Failure Gate ---
+                # Search for FAILED or ERROR in the first 200 chars or last 200 chars to be robust
+                clean_result = result.raw.strip().upper()
+                failure_substrings = ["FAILED", "ERROR", "EXCEPTION", "CRITICAL FAILURE"]
+                
+                # Check start/end of result for failure indicators
+                has_failure_marker = any(sub in clean_result[:500] or sub in clean_result[-500:] for sub in failure_substrings)
+                
+                if has_failure_marker:
+                    rprint(f"\n[bold red]✖ Task {i+1} ({task.agent.role}) reported FAILURE on attempt {attempt}.[/bold red]")
+                    if attempt < max_retries:
+                        rprint(f"[yellow]Triggering retry...[/yellow]")
+                        failure_occurred = True # Temporarily true to keep looping if we hit break
+                    else:
+                        rprint(Panel(
+                            result.raw,
+                            title=f"[bold red]Final Failure: {task.agent.role}[/bold red]",
+                            border_style="red",
+                        ))
+                        failure_occurred = True
+                        break # Out of retry loop
+                else:
+                    rprint(f"[bold green]✓ Task {i+1} ({task.agent.role}) PASSED on attempt {attempt}.[/bold green]")
+                    results.append(result)
+                    failure_occurred = False
+                    break # Out of retry loop successes
+
+        if failure_occurred:
+            rprint(f"[red]Stopping pipeline execution for this feature loop due to persistent failures.[/red]\n")
+            mlflow.log_metric(f"task_{i+1}_failed", 1)
+            break # Out of tasks loop
     
     if failure_occurred:
         rprint(Rule(f"[red]Loop {loop_index} FAILED[/red]"))

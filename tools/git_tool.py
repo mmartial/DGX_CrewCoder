@@ -118,32 +118,46 @@ def sync_workspace() -> str:
     
     # 1. Commit any local work from previous agent steps
     if repo.is_dirty(untracked_files=True):
-        print("-- Sync: Committing local changes before pull...")
+        print(f"-- Sync: Committing local changes before pull in {WORKSPACE}...")
         repo.git.add("-A")
         try:
             repo.git.commit("-m", "automation: sync point before pull")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"-- Sync Warning: Could not commit local changes: {e}")
 
     # 2. Sync with Gitea main branch
     try:
         # Switch to main branch
-        if "main" not in [b.name for b in repo.branches]:
-            repo.git.checkout("-b", "main")
-        else:
-            repo.git.checkout("main")
+        current_branch = repo.active_branch.name
+        if current_branch != "main":
+            print(f"-- Sync: Switching from '{current_branch}' to 'main' for sync.")
+            if "main" not in [b.name for b in repo.branches]:
+                repo.git.checkout("-b", "main")
+            else:
+                repo.git.checkout("main")
         
         # Pull latest changes (e.g., user manual commits)
+        print("-- Sync: Fetching from origin...")
         repo.remotes.origin.fetch()
+        
+        print("-- Sync: Pulling from origin main...")
         try:
-            repo.git.pull("origin", "main", "--rebase=false")
-        except Exception:
-            # If pull fails (e.g. conflicts), we at least fetched
-            pass
+            # Use --no-rebase to avoid complicated states, but handle failures
+            repo.git.pull("origin", "main", "--no-rebase")
+        except Exception as e:
+            print(f"-- Sync Warning: Pull failed: {e}. Checking for conflicts...")
+            if repo.git.execute(["git", "ls-files", "-u"]):
+                print("-- Sync CRITICAL: Merge conflicts detected! Attempting to abort...")
+                repo.git.merge("--abort")
+            else:
+                print("-- Sync: Pull failed but no conflicts detected (maybe already up to date or unrelated history).")
+
     except Exception as e:
         print(f"Warning: Could not sync with Gitea main: {e}")
     
-    return f"Workspace synced at {datetime.now().strftime('%H:%M:%S')}."
+    final_branch = repo.active_branch.name
+    files = [f for f in os.listdir(WORKSPACE) if not f.startswith(".")]
+    return f"Workspace synced on branch '{final_branch}' at {datetime.now().strftime('%H:%M:%S')}. Files: {files}"
 
 
 def _api(method: str, path: str, **kwargs) -> dict:

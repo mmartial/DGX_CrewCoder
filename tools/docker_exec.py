@@ -213,7 +213,11 @@ def write_file(path: str, content: str) -> str:
         
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return f"Written: {target} ({len(content)} chars)"
+    
+    # Verify write immediately
+    if target.exists() and target.stat().st_size == len(content.encode("utf-8")):
+        return f"SUCCESS: Written {target} ({len(content)} chars) for {agent}"
+    return f"ERROR: Failed to verify file write for {target}"
 
 
 @tool("Read file from workspace")
@@ -239,7 +243,7 @@ def read_file(path: str) -> str:
 @tool("List workspace files")
 def list_files(directory: str = ".") -> str:
     """
-    List files in the workspace directory (recursive, up to 3 levels).
+    List files in the workspace directory (recursive, up to 5 levels).
     """
     workspace = Path(os.getenv("WORKSPACE_PATH", "/workspace"))
     if directory.startswith(str(workspace)):
@@ -253,19 +257,32 @@ def list_files(directory: str = ".") -> str:
     if not target.exists():
         return f"Directory not found: {directory}"
 
-    lines = []
-    for p in sorted(target.rglob("*")):
+    lines = [f"Listing files in {target}:"]
+    # We use a custom walker to ensure we don't miss anything and have clear distinction
+    for root, dirs, files in os.walk(target):
         try:
-            rel_p = p.relative_to(target)
-            depth = len(rel_p.parts)
-            if depth > 3:
+            rel_root = Path(root).relative_to(target)
+            depth = len(rel_root.parts)
+            if depth > 5:
                 continue
-            indent = "  " * (depth - 1)
-            suffix = "/" if p.is_dir() else ""
-            lines.append(f"{indent}{p.name}{suffix}")
+            
+            indent = "  " * depth
+            if depth > 0:
+                lines.append(f"{indent[:-2]}📁 {rel_root.name}/")
+            
+            for d in sorted(dirs):
+                if d.startswith(".") and d != ".git": continue
+                # We don't print them here, os.walk will visit them
+                pass
+                
+            for f in sorted(files):
+                if f.startswith(".") and f not in [".env", ".gitignore"]: continue
+                lines.append(f"{indent}📄 {f}")
+                
         except ValueError:
             continue
-    return "\n".join(lines) or "(empty)"
+            
+    return "\n".join(lines) if len(lines) > 1 else f"Listing files in {target}: (empty)"
 
 
 

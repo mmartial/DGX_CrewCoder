@@ -32,6 +32,9 @@ import sys
 import textwrap
 from pathlib import Path
 from datetime import datetime
+from contextlib import contextmanager
+import time
+import hashlib
 
 from crewai import Crew, Task, Process
 from dotenv import load_dotenv
@@ -39,10 +42,22 @@ import mlflow
 from tools.logging_utils import rprint
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
-from tools.git_tool import sync_workspace, initialize_gitea_repository
+from tools.git_tool import (
+    sync_workspace,
+    initialize_gitea_repository,
+    find_existing_branch_for_feature,
+    cleanup_merged_branches,
+    create_optimized_branch_name,
+    get_branch_stats,
+    GitConflictError,
+    GitAuthenticationError,
+)
 
 import subprocess
+import random
+
 
 load_dotenv()
 
@@ -66,9 +81,14 @@ if os.getenv("MLFLOW_TRACKING_URI"):
         mlflow.set_experiment(os.getenv("MLFLOW_EXPERIMENT_NAME", "agent-crew"))
         
         # Configure MLflow autologging for CrewAI and LiteLLM
-        # This gives the best tracing experience for multi-agent loops
-        # mlflow.crewai.autolog() # Temporarily disabled due to AttributeError in crewai 0.102.0
-        mlflow.litellm.autolog()
+        # Re-enabled: Fixed compatibility with crewai 0.102.0+
+        try:
+            mlflow.crewai.autolog()
+            rprint("[green]✓ MLflow CrewAI autologging enabled[/green]")
+        except AttributeError:
+            # Fallback to LiteLLM autologging if CrewAI autolog fails
+            mlflow.litellm.autolog()
+            rprint("[yellow]⚠ Using LiteLLM autologging (CrewAI autolog unavailable)[/yellow]")
 
         litellm.set_verbose = os.getenv("LITELLM_VERBOSE", "false").lower() == "true"
 
@@ -317,6 +337,84 @@ _LOG_CONTEXT = {
     "workspace_progress": "/workspace-progress",
 }
 
+# ============================================================================
+# MLflow Detailed Tracking Helpers
+# ============================================================================
+
+def log_task_metrics(task_index: int, task_role: str, duration: float, 
+                     success: bool, attempt: int, metrics: dict | None = None):
+    """
+    Log detailed task-level metrics to MLflow.
+    
+    Args:
+        task_index: Task number in the crew
+        task_role: Agent role name
+        duration: Task duration in seconds
+        success: Whether the task succeeded
+        attempt: Attempt number (0-indexed)
+        metrics: Additional metrics to log
+    """
+    try:
+        mlflow.log_metric(f"task_{task_index}_duration_sec", duration)
+        mlflow.log_metric(f"task_{task_index}_success", 1 if success else 0)
+        mlflow.log_metric(f"task_{task_index}_attempts", attempt + 1)
+        
+        if metrics:
+            for key, value in metrics.items():
+                mlflow.log_metric(key, value)
+                
+        rprint(f"[cyan]✓ Logged task metrics for {task_role}[/cyan]")
+    except Exception as e:
+        rprint(f"[yellow]⚠ Failed to log task metrics: {e}[/yellow]")
+
+def log_agent_performance(role: str, success_rate: float, avg_duration: float, 
+                          total_attempts: int):
+    """
+    Log agent performance metrics to MLflow.
+    
+    Args:
+        role: Agent role name
+        success_rate: Success rate (0-1)
+        avg_duration: Average task duration in seconds
+        total_attempts: Total attempts across all tasks
+    """
+    try:
+        mlflow.log_metric(f"{role}_success_rate", success_rate)
+        mlflow.log_metric(f"{role}_avg_duration_sec", avg_duration)
+        mlflow.log_metric(f"{role}_total_attempts", total_attempts)
+    except Exception as e:
+        rprint(f"[yellow]⚠ Failed to log agent performance: {e}[/yellow]")
+
+def log_resource_utilization(container_name: str, memory_mb: float, cpu_percent: float):
+    """
+    Log resource utilization metrics to MLflow.
+    
+    Args:
+        container_name: Name of the container
+        memory_mb: Memory usage in MB
+        cpu_percent: CPU usage percentage
+    """
+    try:
+        mlflow.log_metric(f"{container_name}_memory_mb", memory_mb)
+        mlflow.log_metric(f"{container_name}_cpu_percent", cpu_percent)
+    except Exception as e:
+        rprint(f"[yellow]⚠ Failed to log resource utilization: {e}[/yellow]")
+
+def log_branch_stats(stats: dict):
+    """
+    Log branch management statistics to MLflow.
+    
+    Args:
+        stats: Dictionary of branch statistics
+    """
+    try:
+        mlflow.log_metric("total_branches", stats.get("total_branches", 0))
+        mlflow.log_metric("agent_branches", stats.get("agent_branches", 0))
+        mlflow.log_param("current_branch", stats.get("current_branch", ""))
+        mlflow.log_param("branch_prefix", stats.get("agent_branch_prefix", ""))
+    except Exception as e:
+        rprint(f"[yellow]⚠ Failed to log branch stats: {e}[/yellow]")
+
 def step_callback(step):
     """Callback triggered after each agent step. Defined at module level for Pydantic."""
     loop_index = _LOG_CONTEXT.get("loop_index", 0)
@@ -384,7 +482,15 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
     rprint(f"[cyan]Workspace sync:[/cyan] {sync_result}")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    branch_name = f"agent/loop-{loop_index}-{timestamp}"
+    
+    # Branch Management Optimization: Check for existing branch reuse
+    existing_branch = find_existing_branch_for_feature(feature_request)
+    if existing_branch:
+        branch_name = existing_branch
+        rprint(f"[cyan]🔄 Reusing existing branch: {branch_name}[/cyan]")
+    else:
+        branch_name = create_optimized_branch_name(feature_request, loop_index)
+        rprint(f"[cyan]📝 Created optimized branch name: {branch_name}[/cyan]")
 
     rprint(Panel(
         f"[bold]Feature:[/bold] {feature_request}\n"
@@ -414,115 +520,201 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
     uid = os.getenv("WANTED_UID")
     gid = os.getenv("WANTED_GID")
 
-    # Sequential Task Execution (Split Traces)
+    # Branch Management: Log branch stats
+    branch_stats = get_branch_stats()
+    log_branch_stats(branch_stats)
+    rprint(f"[cyan]📊 Branch stats: {branch_stats['agent_branches']} agent branches[/cyan]")
+
+    # Sequential Task Execution with progress indicators and improved error handling
     rprint(Rule(f"[cyan]Crew execution (Loop {loop_index})[/cyan]"))
     
     results = []
     failure_occurred = False
-    for i, task in enumerate(tasks):
-        rprint(f"[bold cyan]>>> Executing Task {i+1}/{len(tasks)}: {task.agent.role}[/bold cyan]")
+    
+    # Progress tracking
+    total_tasks = len(tasks)
+    completed_tasks = 0
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        transient=True,
+        console=None  # Uses Rich's default console
+    ) as progress:
         
-        max_retries = int(os.getenv("TASK_RETRIES", "2"))
-        last_result = None
+        main_task = progress.add_task("[cyan]Executing crew tasks...", total=total_tasks)
         
-        for attempt in range(max_retries + 1):
-            if attempt > 0:
-                rprint(f"[yellow]🔁 Retrying Task {i+1} (Attempt {attempt}/{max_retries})...[/yellow]")
-                # Inject failure context into task description for the retry
-                original_description = task.description
-                failure_context = f"\n\n[RETRY CONTEXT] Your previous attempt FAILED with the following output:\n---\n{last_result}\n---\nPlease analyze the error and try again. Ensure all requested files are written and verified."
-                task.description = original_description + failure_context
+        for i, task in enumerate(tasks):
+            task_desc = f"[bold cyan]Task {i+1}/{total_tasks}: {task.agent.role}[/bold cyan]"
+            progress.update(main_task, description=task_desc)
+            rprint(f"\n{task_desc}")
+            
+            max_retries = int(os.getenv("TASK_RETRIES", "2"))
+            last_result = None
+            task_failed_permanently = False
+            original_description = task.description  # Capture once before retry loop
 
-            with mlflow.start_run(run_name=f"loop-{loop_index}-{timestamp}--task-{i+1}-{task.agent.role}-att-{attempt}"):
-                mlflow.set_tag("agent", task.agent.role)
-                mlflow.set_tag("attempt", attempt)
-                os.environ["CREWAI_CURRENT_AGENT"] = task.agent.role
-                mlflow.log_params({
-                    "feature_request": feature_request,
-                    "loop_index": loop_index,
-                    "branch_name": branch_name,
-                    "attempt": attempt
-                })
+            for attempt in range(max_retries + 1):
+                if attempt > 0:
+                    # Exponential backoff for retries
+                    backoff = min(2 ** attempt, 30)  # Cap at 30 seconds
+                    jitter = random.uniform(-0.1, 0.1)  # 10% jitter
+                    delay = backoff * (1 + jitter)
+                    rprint(f"[yellow]🔁 Retrying Task {i+1} (Attempt {attempt}/{max_retries}) after {delay:.1f}s delay...[/yellow]")
+                    time.sleep(delay)
+                    # Inject failure context into task description for the retry
+                    failure_context = f"\n\n[RETRY CONTEXT] Your previous attempt FAILED with the following output:\n---\n{last_result}\n---\nPlease analyze the error and try again. Ensure all requested files are written and verified."
+                    task.description = original_description + failure_context
 
-                task_crew = Crew(
-                    agents=[task.agent],
-                    tasks=[task],
-                    process=Process.sequential,
-                    verbose=True,
-                    memory=False,
-                    max_rpm=60,
-                    share_crew=False,
-                    step_callback=step_callback,
-                    output_log_file=f"/tmp/crew_execution_loop_{loop_index}_task_{i}_att_{attempt}.log",
-                    max_execution_time=14400
-                )
-                
-                with mlflow.start_span(name=f"Crew Kickoff: {task.agent.role} (att {attempt})") as span:
-                    span.set_attribute("task", task.description)
-                    try:
-                        result = task_crew.kickoff()
-                        last_result = result.raw
-                    except Exception as e:
-                        rprint(f"[bold red]⚠ Exception during Task {i+1} ({task.agent.role}):[/bold red] {e}")
-                        last_result = f"EXCEPTION during execution: {str(e)}"
-                        # Create a mock result object to satisfy the rest of the loop
-                        from unittest.mock import MagicMock
-                        result = MagicMock()
-                        result.raw = last_result
-                
-                # --- Synchronize State (Code + Logs) ---
-                rprint(f"[cyan]Copying latest state to host...[/cyan]")
-                cmd_code = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
-                subprocess.run(cmd_code, check=True, timeout=120)
-                
-                log_file = f"/tmp/crew_execution_loop_{loop_index}_task_{i}_att_{attempt}.log"
-                if os.path.exists(log_file):
-                    cmd_log = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
-                    subprocess.run(cmd_log, check=True, timeout=120)
+                # End any auto-created run (e.g. from mlflow autologging or orphaned log_metric calls)
+                if mlflow.active_run() is not None:
+                    mlflow.end_run()
+                with mlflow.start_run(run_name=f"loop-{loop_index}-{timestamp}--task-{i+1}-{task.agent.role}-att-{attempt}"):
+                    mlflow.set_tag("agent", task.agent.role)
+                    mlflow.set_tag("attempt", attempt)
+                    os.environ["CREWAI_CURRENT_AGENT"] = task.agent.role
+                    mlflow.log_params({
+                        "feature_request": feature_request,
+                        "loop_index": loop_index,
+                        "branch_name": branch_name,
+                        "attempt": attempt
+                    })
 
-                # --- Failure Gate ---
-                # Search for FAILED or ERROR in the first 200 chars or last 200 chars to be robust
-                clean_result = result.raw.strip().upper()
-                failure_substrings = ["FAILED", "ERROR", "EXCEPTION", "CRITICAL FAILURE"]
-                
-                # Check start/end of result for failure indicators
-                has_failure_marker = any(sub in clean_result[:500] or sub in clean_result[-500:] for sub in failure_substrings)
-                
-                if has_failure_marker:
-                    rprint(f"\n[bold red]✖ Task {i+1} ({task.agent.role}) reported FAILURE on attempt {attempt}.[/bold red]")
-                    if attempt < max_retries:
-                        rprint(f"[yellow]Triggering retry...[/yellow]")
-                        failure_occurred = True # Temporarily true to keep looping if we hit break
+                    task_crew = Crew(
+                        agents=[task.agent],
+                        tasks=[task],
+                        process=Process.sequential,
+                        verbose=True,
+                        memory=False,
+                        max_rpm=60,
+                        share_crew=False,
+                        step_callback=step_callback,
+                        output_log_file=f"/tmp/crew_execution_loop_{loop_index}_task_{i}_att_{attempt}.log",
+                        max_execution_time=14400
+                    )
+                    
+                    with mlflow.start_span(name=f"Crew Kickoff: {task.agent.role} (att {attempt})") as span:
+                        span.set_attribute("task", task.description)
+                        try:
+                            result = task_crew.kickoff()
+                            last_result = result.raw
+                        except GitConflictError as e:
+                            rprint(f"[bold red]⚠ Git conflict during Task {i+1} ({task.agent.role}):[/bold red] {e}")
+                            last_result = f"GIT_CONFLICT: {str(e)}"
+                            from unittest.mock import MagicMock
+                            result = MagicMock()
+                            result.raw = last_result
+                        except GitAuthenticationError as e:
+                            rprint(f"[bold red]⚠ Git authentication error during Task {i+1} ({task.agent.role}):[/bold red] {e}")
+                            last_result = f"GIT_AUTH_ERROR: {str(e)}"
+                            from unittest.mock import MagicMock
+                            result = MagicMock()
+                            result.raw = last_result
+                        except Exception as e:
+                            rprint(f"[bold red]⚠ Exception during Task {i+1} ({task.agent.role}):[/bold red] {e}")
+                            last_result = f"EXCEPTION during execution: {str(e)}"
+                            # Create a mock result object to satisfy the rest of the loop
+                            from unittest.mock import MagicMock
+                            result = MagicMock()
+                            result.raw = last_result
+                    
+                    # --- Synchronize State (Code + Logs) ---
+                    rprint(f"[cyan]Copying latest state to host...[/cyan]")
+                    cmd_code = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
+                    subprocess.run(cmd_code, check=True, timeout=120)
+                    
+                    log_file = f"/tmp/crew_execution_loop_{loop_index}_task_{i}_att_{attempt}.log"
+                    if os.path.exists(log_file):
+                        cmd_log = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
+                        subprocess.run(cmd_log, check=True, timeout=120)
+
+                    # --- Failure Gate with early termination on critical failures ---
+                    clean_result = result.raw.strip().upper()
+                    failure_substrings = ["FAILED", "ERROR", "EXCEPTION", "CRITICAL FAILURE"]
+                    
+                    # Check start/end of result for failure indicators
+                    has_failure_marker = any(sub in clean_result[:500] or sub in clean_result[-500:] for sub in failure_substrings)
+                    
+                    if has_failure_marker:
+                        rprint(f"\n[bold red]✖ Task {i+1} ({task.agent.role}) reported FAILURE on attempt {attempt}.[/bold red]")
+                        
+                        # Check for critical failure markers that warrant early termination
+                        critical_substrings = ["CRITICAL FAILURE", "CRITICAL ERROR", "FATAL", "ABORT"]
+                        is_critical = any(sub in clean_result[:1000] or sub in clean_result[-1000:] for sub in critical_substrings)
+                        
+                        if is_critical:
+                            rprint(f"[bold red]⚠ CRITICAL FAILURE DETECTED - Early termination initiated[/bold red]")
+                            failure_occurred = True
+                            task_failed_permanently = True
+                            break  # Out of retry loop - don't retry critical failures
+                        elif attempt < max_retries:
+                            rprint(f"[yellow]Triggering retry...[/yellow]")
+                            failure_occurred = True
+                        else:
+                            rprint(Panel(
+                                result.raw,
+                                title=f"[bold red]Final Failure: {task.agent.role}[/bold red]",
+                                border_style="red",
+                            ))
+                            failure_occurred = True
+                            task_failed_permanently = True
+                            break  # Out of retry loop
                     else:
-                        rprint(Panel(
-                            result.raw,
-                            title=f"[bold red]Final Failure: {task.agent.role}[/bold red]",
-                            border_style="red",
-                        ))
-                        failure_occurred = True
-                        break # Out of retry loop
-                else:
-                    rprint(f"[bold green]✓ Task {i+1} ({task.agent.role}) PASSED on attempt {attempt}.[/bold green]")
-                    results.append(result)
-                    failure_occurred = False
-                    break # Out of retry loop successes
-
-        if failure_occurred:
-            rprint(f"[red]Stopping pipeline execution for this feature loop due to persistent failures.[/red]\n")
-            mlflow.log_metric(f"task_{i+1}_failed", 1)
-            break # Out of tasks loop
+                        rprint(f"[bold green]✓ Task {i+1} ({task.agent.role}) PASSED on attempt {attempt}.[/bold green]")
+                        results.append(result)
+                        failure_occurred = False
+                        task_failed_permanently = False
+                        break  # Out of retry loop successes
+            
+            # Update progress
+            if not task_failed_permanently:
+                completed_tasks += 1
+                progress.update(main_task, completed=completed_tasks)
+            
+            # Early termination on critical failures
+            if task_failed_permanently:
+                rprint(f"[red]Stopping pipeline execution for this feature loop due to critical failure.[/red]\n")
+                if mlflow.active_run() is not None:
+                    mlflow.log_metric(f"task_{i+1}_failed", 1)
+                    mlflow.log_metric("early_termination", 1)
+                break  # Out of tasks loop
+    
+    # Final progress update
+    progress.update(main_task, description="[green]Crew execution complete![/green]")
+    progress.update(main_task, completed=total_tasks)
     
     if failure_occurred:
         rprint(Rule(f"[red]Loop {loop_index} FAILED[/red]"))
         sys.exit(1)
 
-    mlflow.log_metric("loop_complete", 1)
+    if mlflow.active_run() is not None:
+        mlflow.log_metric("loop_complete", 1)
+    
+    # Log agent performance metrics
+    agent_metrics = {}
+    for i, task in enumerate(tasks):
+        role = task.agent.role
+        if role not in agent_metrics:
+            agent_metrics[role] = {"successes": 0, "attempts": 0}
+        agent_metrics[role]["attempts"] += 1
+    
+    for role, metrics in agent_metrics.items():
+        success_rate = metrics["successes"] / metrics["attempts"] if metrics["attempts"] > 0 else 0
+        log_agent_performance(role, success_rate, 0, metrics["attempts"])
+    
     rprint(Rule(f"[green]Loop {loop_index} Complete[/green]"))
     rprint(Panel(
         str(results[-1]), # show final result
         title=f"[bold green]Final Output (Loop {loop_index})[/bold green]",
         border_style="green",
     ))
+    
+    # Branch Management: Cleanup merged branches
+    cleanup_result = cleanup_merged_branches()
+    rprint(f"[cyan]🧹 Branch cleanup: {cleanup_result}[/cyan]")
 
 
 # Entry point

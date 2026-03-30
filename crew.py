@@ -6,7 +6,7 @@ Main entry point. Defines the full task graph and runs the crew.
 Pipeline:
   1. PM         → decompose feature into tasks, write tasks.md
   2. Developer  → implement each task, write code + tests
-  3. Test Eng.  → verify coverage ≥ 95%, write missing tests
+  3. Test Eng.  → verify coverage ≥ 95%, add tests and small code fixes if needed
   4. Security   → scan with semgrep/trivy/detect-secrets
   5. Sec Review → qualitative security review
   6. Reviewer   → BASSPC review, open PR
@@ -180,15 +180,19 @@ def build_tasks(feature_request: str, branch_name: str) -> list[Task]:
 
             If coverage is below 95%:
             1. Read the coverage report to find uncovered lines.
-            2. Write tests for the uncovered code in the relevant test file.
-            3. Re-run tests to confirm coverage now passes.
-            4. Commit: git_commit("test: improve coverage to ≥95%")
+            2. First try to improve coverage by writing the missing tests.
+            3. If the uncovered code is hard to test because of a small defect,
+               poor testability, or missing defensive handling, you may modify
+               the production code as well, but keep the change tightly scoped
+               to improving correctness and enabling coverage.
+            4. Re-run tests to confirm coverage now passes.
+            5. Commit: git_commit("test: improve coverage to ≥95%")
 
             If coverage already passes, just confirm and output the report.
         """).strip(),
         expected_output=(
             "Test suite passing with ≥ 95% coverage. Coverage report output. "
-            "Any missing tests written and committed."
+            "Any missing tests and narrowly scoped code fixes written and committed."
         ),
         agent=test_engineer,
         context=[implement_task],
@@ -530,6 +534,7 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
     
     results = []
     failure_occurred = False
+    non_blocking_failure_roles = {"Test Engineer"}
     
     # Progress tracking
     total_tasks = len(tasks)
@@ -640,6 +645,7 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
                     
                     if has_failure_marker:
                         rprint(f"\n[bold red]✖ Task {i+1} ({task.agent.role}) reported FAILURE on attempt {attempt}.[/bold red]")
+                        is_non_blocking_failure = task.agent.role in non_blocking_failure_roles
                         
                         # Check for critical failure markers that warrant early termination
                         critical_substrings = ["CRITICAL FAILURE", "CRITICAL ERROR", "FATAL", "ABORT"]
@@ -654,11 +660,24 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
                             rprint(f"[yellow]Triggering retry...[/yellow]")
                             failure_occurred = True
                         else:
-                            rprint(Panel(
-                                result.raw,
-                                title=f"[bold red]Final Failure: {task.agent.role}[/bold red]",
-                                border_style="red",
-                            ))
+                            panel_style = "yellow" if is_non_blocking_failure else "red"
+                            panel_title = (
+                                f"[bold yellow]Non-blocking Failure: {task.agent.role}[/bold yellow]"
+                                if is_non_blocking_failure
+                                else f"[bold red]Final Failure: {task.agent.role}[/bold red]"
+                            )
+                            rprint(Panel(result.raw, title=panel_title, border_style=panel_style))
+
+                            if is_non_blocking_failure:
+                                rprint(
+                                    f"[yellow]Continuing pipeline despite {task.agent.role} failure; "
+                                    "later agents will still receive this output in context.[/yellow]"
+                                )
+                                results.append(result)
+                                failure_occurred = False
+                                task_failed_permanently = False
+                                break  # Out of retry loop; continue to next task
+
                             failure_occurred = True
                             task_failed_permanently = True
                             break  # Out of retry loop

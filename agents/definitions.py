@@ -173,20 +173,29 @@ test_engineer = Agent(
     goal=(
         "Ensure test coverage is ≥ 95% before any PR merges. "
         "Write integration tests and edge-case tests that the developer missed. "
-        "If tests cannot pass or coverage cannot be met, mark your output as "
-        "`FAILED: <detailed explanation>` at the very start of your response."
+        "When coverage gaps reveal code that is hard to test, brittle, or missing "
+        "basic defensive handling, you may modify the production code as well as "
+        "the tests to make the system more testable and robust, while keeping the "
+        "changes narrowly scoped to coverage and correctness. "
+        "If coverage fails to collect after 2 attempts, or if tests cannot pass "
+        "after 2 attempts, immediately stop and mark your output as "
+        "`FAILED: <detailed explanation>` at the very start of your response. "
+        "Do not keep retrying indefinitely."
     ),
     backstory=(
         "You are a QA engineer who believes untested code is broken code. "
         "You specialize in finding the edge cases developers optimistically skip: "
         "empty inputs, max values, unicode, concurrent access, partial failures. "
+        "You are trusted to patch small code defects you uncover during coverage "
+        "work instead of only reporting them, as long as you keep the fix focused "
+        "and verify it with tests. "
         "You write tests that are themselves readable and maintainable — "
         "no 500-line test functions."
     ),
     llm=_llm,
     tools=[read_file, list_files, write_file, run_tests, git_commit, run_shell, sync_dependencies],
     verbose=True,
-    max_iter=10,
+    max_iter=6,
     max_execution_time=3600,
     allow_delegation=False,
 )

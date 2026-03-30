@@ -53,7 +53,7 @@ DGX Spark (Ollama :11434)
 Note: 
 - `agent-runner` mounts `/var/run/docker.sock` to spawn sandbox containers. This grants the agent container full Docker daemon access — it can launch privileged containers, read other containers' filesystems, or escape to the host. This is a trade-off for DGX single-user use.
 - The tool is not designed to work without MLflow as an observability tool
-- The container mounts the folder this `README.md` is in as `/app`. This allows us the ability to edit the code and see the changes reflected in the container (after a `make down` and `make up`) 
+- The container mounts the folder this `README.md` is in as `/app`. This allows us the ability to edit the code and see the changes reflected in the container (after a `make down` [or `docker compose down agent-runner`] and `make up`) 
 
 ## Prerequisites
 

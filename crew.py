@@ -418,6 +418,7 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
     rprint(Rule(f"[cyan]Crew execution (Loop {loop_index})[/cyan]"))
     
     results = []
+    failure_occurred = False
     for i, task in enumerate(tasks):
         rprint(f"[bold cyan]>>> Executing Task {i+1}/{len(tasks)}: {task.agent.role}[/bold cyan]")
         
@@ -450,18 +451,39 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
                 result = task_crew.kickoff()
             results.append(result)
 
-        # Copy code from workspace to workspace-copy as WANTED_UID and WANTED_GID
-        rprint(f"[cyan]Copy code from {workspace_path} to {workspace_copy}...[/cyan]")
-        cmd = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
-        subprocess.run(cmd, check=True, timeout=120)
+            # --- Synchronize State (Code + Logs) ---
+            # We do this after every task regardless of success/failure
+            rprint(f"[cyan]Copying latest state to host...[/cyan]")
+            
+            # Code
+            cmd_code = ["rsync", "-av", f"--chown={uid}:{gid}", f"{workspace_path}/", f"{workspace_copy}/", "--exclude", ".git", "--exclude", "__pycache__", "--delete"]
+            subprocess.run(cmd_code, check=True, timeout=120)
+            
+            # Logs
+            log_file = f"/tmp/crew_execution_loop_{loop_index}_task_{i}.log"
+            if os.path.exists(log_file):
+                cmd_log = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
+                subprocess.run(cmd_log, check=True, timeout=120)
 
-        # Copy log file to workspace-progress as WANTED_UID and WANTED_GID
-        log_file = f"/tmp/crew_execution_loop_{loop_index}_task_{i}.log"
-        if os.path.exists(log_file):
-            rprint(f"[cyan]Copy log file to {workspace_progress}...[/cyan]")
-            cmd = ["rsync", "-av", f"--chown={uid}:{gid}", log_file, f"{workspace_progress}/"]
-            subprocess.run(cmd, check=True, timeout=120)
-
+            # --- Failure Gate ---
+            # We only trigger a terminal loop failure if the agent explicitly 
+            # starts its final answer with a failure prefix.
+            clean_result = result.raw.strip().upper()
+            if clean_result.startswith(("FAILED", "ERROR")):
+                rprint(f"\n[bold red]✖ Task {i+1} ({task.agent.role}) FAILED![/bold red]")
+                rprint(Panel(
+                    result.raw,
+                    title=f"[bold red]Failure Summary: {task.agent.role}[/bold red]",
+                    border_style="red",
+                ))
+                rprint(f"[red]Stopping pipeline execution for this feature loop.[/red]\n")
+                mlflow.log_metric(f"task_{i+1}_failed", 1)
+                failure_occurred = True
+                break
+    
+    if failure_occurred:
+        rprint(Rule(f"[red]Loop {loop_index} FAILED[/red]"))
+        sys.exit(1)
 
     mlflow.log_metric("loop_complete", 1)
     rprint(Rule(f"[green]Loop {loop_index} Complete[/green]"))
@@ -498,9 +520,13 @@ if __name__ == "__main__":
         rprint(f"[red]Error:[/red] '{task_file}' is empty.")
         sys.exit(1)
 
+    # 0. delete the COMPLETED file if it exists + Copy workspace-copy to workspace to initialize it
+    if os.path.exists(f"{workspace_copy}/COMPLETED"):
+        os.remove(f"{workspace_copy}/COMPLETED")
+
     local_uid = os.getuid()
     local_gid = os.getgid()
-    # Copy workspace-copy to workspace to initialize it
+
     cmd = ["rsync", "-av", f"--chown={local_uid}:{local_gid}", workspace_copy+"/", workspace_path+"/"]
     subprocess.run(cmd, check=True, timeout=120)
 

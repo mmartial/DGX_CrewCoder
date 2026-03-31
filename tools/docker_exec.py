@@ -266,7 +266,7 @@ def sync_dependencies() -> str:
 
 
 @tool("Run pytest in sandbox")
-def run_tests(test_path: str = ".", extra_args: str = "--tb=short -q --cov=. --cov-report=term-missing") -> str:
+def run_tests(test_path: str = ".", extra_args: str = "--tb=line -q --maxfail=5 --cov=. --cov-report=term-missing:skip-covered") -> str:
     """
     Run the test suite with pytest inside the sandbox.
     Returns pass/fail counts and any failure details.
@@ -428,14 +428,14 @@ def _format_result(result: dict) -> str:
     prefix = f"[{status} Agent: {agent} | job:{job}]"
     
     # Tool Output Optimization: Truncate long outputs with summary
-    MAX_OUTPUT_LENGTH = int(os.getenv("MAX_TOOL_OUTPUT_LENGTH", "1000"))
+    MAX_OUTPUT_LENGTH = int(os.getenv("MAX_TOOL_OUTPUT_LENGTH", "500"))
     
     if len(out) <= MAX_OUTPUT_LENGTH:
         return f"{prefix}\n{out}" if out else f"{prefix} (no output)"
     
     # Truncate with summary
-    first_500 = out[:500]
-    last_500 = out[-500:]
-    summary = f"[Output truncated: {len(out)} chars total. Showing first 500 + last 500 chars.]"
+    first_chunk = out[:250]
+    last_chunk = out[-250:]
+    summary = f"[Output truncated: {len(out)} chars total. Showing first 250 + last 250 chars.]"
     
-    return f"{prefix}\n{first_500}\n\n... (truncated) ...\n\n{last_500}\n\n{summary}"
+    return f"{prefix}\n{first_chunk}\n\n... (truncated) ...\n\n{last_chunk}\n\n{summary}"

@@ -30,6 +30,12 @@ _headers = {
     "Content-Type": "application/json",
 }
 
+# Set once the first pull has been completed in this pipeline run.
+# Subsequent sync_workspace() calls commit local changes but skip the remote pull
+# because agents run sequentially on a shared workspace volume — the previous
+# agent already pushed its work, so pulling again is redundant.
+_workspace_pulled_this_session: bool = False
+
 # Retry configuration
 GIT_MAX_RETRIES = int(os.getenv("GIT_MAX_RETRIES", "3"))
 GIT_INITIAL_BACKOFF = float(os.getenv("GIT_INITIAL_BACKOFF", "1.0"))
@@ -223,15 +229,19 @@ def initialize_gitea_repository() -> str:
 
 def sync_workspace() -> str:
     """
-    Safe per-loop synchronization.
-    Commits local changes and pulls the latest main branch from Gitea.
+    Safe per-step synchronization.
+    Always commits local changes; pulls from Gitea only on the first call per
+    pipeline run. Subsequent calls skip the pull because agents run sequentially
+    on a shared workspace volume — each agent pushes its work, so the next agent
+    does not need to re-pull.
     Assumes initialize_gitea_repository() was called at startup.
     """
+    global _workspace_pulled_this_session
     repo = _repo()
-    
+
     # 1. Commit any local work from previous agent steps
     if repo.is_dirty(untracked_files=True):
-        print(f"-- Sync: Committing local changes before pull in {WORKSPACE}...")
+        print(f"-- Sync: Committing local changes in {WORKSPACE}...")
         repo.git.add("-A")
         try:
             repo.git.commit("-m", "automation: sync point before pull")
@@ -248,7 +258,15 @@ def sync_workspace() -> str:
         except Exception as e:
             print(f"-- Sync Warning: Could not commit local changes: {e}")
 
-    # 2. Sync with Gitea main branch
+    # 2. Pull only once per pipeline run — workspace volume is shared between
+    #    sequential agents, so after the first pull the workspace is already current.
+    if _workspace_pulled_this_session:
+        print("-- Sync: Skipping remote pull (already pulled this pipeline run)")
+        final_branch = repo.active_branch.name
+        files = [f for f in os.listdir(WORKSPACE) if not f.startswith(".")]
+        return f"Workspace synced (pull skipped — already pulled this run) on branch '{final_branch}'. Files: {files}"
+
+    # 3. Sync with Gitea main branch
     try:
         # Switch to main branch
         current_branch = repo.active_branch.name
@@ -290,7 +308,8 @@ def sync_workspace() -> str:
         raise
     except Exception as e:
         print(f"Warning: Could not sync with Gitea main: {e}")
-    
+
+    _workspace_pulled_this_session = True
     final_branch = repo.active_branch.name
     files = [f for f in os.listdir(WORKSPACE) if not f.startswith(".")]
     return f"Workspace synced on branch '{final_branch}' at {datetime.now().strftime('%H:%M:%S')}. Files: {files}"

@@ -31,6 +31,7 @@ services:
       CONTAINERS: 1
       IMAGES: 1
       POST: 1
+      EXEC: 1        # required for exec_run() (warm container reuse)
       VOLUMES: 1
       NETWORKS: 1
       # Everything else defaults to 0 (blocked)

@@ -153,6 +153,15 @@ def _container_key(image: str, allow_network: bool) -> str:
     return f"{image}:{'net' if allow_network else 'nonet'}"
 
 
+def _is_stopped_container_exec_error(error: Exception) -> bool:
+    """Return True when Docker exec failed because the target container stopped."""
+    error_text = str(error).lower()
+    return (
+        "oci runtime exec failed" in error_text
+        and "state stopped" in error_text
+    )
+
+
 def _get_warm_container(image: str, allow_network: bool) -> Any:
     """Return a running warm container, creating one if necessary."""
     key = _container_key(image, allow_network)
@@ -171,7 +180,9 @@ def _get_warm_container(image: str, allow_network: bool) -> Any:
         rprint(f"[yellow]🚀 Starting warm container: {image}[/yellow]")
         container = _client.containers.run(
             image=image,
-            command="sleep infinity",
+            # Keep the sandbox alive with a simple shell loop. This is more
+            # resilient across runtimes than relying on `sleep infinity`.
+            command=["/bin/sh", "-lc", "trap : TERM INT; while true; do sleep 3600; done"],
             detach=True,
             volumes=_BASE_VOLUMES,
             working_dir="/workspace",
@@ -215,7 +226,8 @@ atexit.register(_cleanup_warm_containers)
 def _exec_in_warm_container(image: str, command: str, allow_network: bool = False) -> dict:
     """
     Execute a command in a persistent warm container via exec_run.
-    Falls back to a fresh container on failure.
+    Falls back to a throwaway container when the warm container stops or exec
+    is otherwise incompatible with the active runtime.
     """
     job_id = uuid.uuid4().hex[:10]
 
@@ -244,6 +256,15 @@ def _exec_in_warm_container(image: str, command: str, allow_network: bool = Fals
             key = _container_key(image, allow_network)
             with _containers_lock:
                 _warm_containers.pop(key, None)
+            if _is_stopped_container_exec_error(e):
+                rprint("[yellow]⚠ Warm container stopped before exec; falling back to throwaway container for this run...[/yellow]")
+                fallback_result = _run_throwaway_container(
+                    image=image,
+                    command=command,
+                    allow_network=allow_network,
+                )
+                fallback_result.setdefault("job_id", job_id)
+                return fallback_result
             if attempt == 2:
                 return {"success": False, "output": str(e), "job_id": job_id}
             rprint(f"[yellow]⚠ Container exec failed (attempt {attempt + 1}/3), retrying with fresh container...[/yellow]")

@@ -6,10 +6,6 @@ Docker container using the gVisor (runsc) runtime for kernel isolation.
 
 Agents call run_code() or run_tests(). Never runs as root.
 
-Optimizations:
-- Warm container pool: containers stay alive between calls (no per-call startup)
-- Hash-based caching: skip re-running unchanged dependency installs and scans
-- Shared volumes: workspace + venv volumes persist across all runs
 """
 
 from __future__ import annotations

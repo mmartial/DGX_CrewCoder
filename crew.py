@@ -563,6 +563,7 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
             original_description = task.description  # Capture once before retry loop
 
             for attempt in range(max_retries + 1):
+                execution_error = False
                 if attempt > 0:
                     # Exponential backoff for retries
                     backoff = min(2 ** attempt, 30)  # Cap at 30 seconds
@@ -607,18 +608,21 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
                             result = task_crew.kickoff()
                             last_result = result.raw
                         except GitConflictError as e:
+                            execution_error = True
                             rprint(f"[bold red]⚠ Git conflict during Task {i+1} ({task.agent.role}):[/bold red] {e}")
                             last_result = f"GIT_CONFLICT: {str(e)}"
                             from unittest.mock import MagicMock
                             result = MagicMock()
                             result.raw = last_result
                         except GitAuthenticationError as e:
+                            execution_error = True
                             rprint(f"[bold red]⚠ Git authentication error during Task {i+1} ({task.agent.role}):[/bold red] {e}")
                             last_result = f"GIT_AUTH_ERROR: {str(e)}"
                             from unittest.mock import MagicMock
                             result = MagicMock()
                             result.raw = last_result
                         except Exception as e:
+                            execution_error = True
                             rprint(f"[bold red]⚠ Exception during Task {i+1} ({task.agent.role}):[/bold red] {e}")
                             last_result = f"EXCEPTION during execution: {str(e)}"
                             # Create a mock result object to satisfy the rest of the loop
@@ -637,19 +641,37 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
                         subprocess.run(cmd_log, check=True, timeout=120)
 
                     # --- Failure Gate with early termination on critical failures ---
-                    clean_result = result.raw.strip().upper()
-                    failure_substrings = ["FAILED", "ERROR", "EXCEPTION", "CRITICAL FAILURE"]
-                    
-                    # Check start/end of result for failure indicators
-                    has_failure_marker = any(sub in clean_result[:500] or sub in clean_result[-500:] for sub in failure_substrings)
+                    raw_result = getattr(result, "raw", "") or ""
+                    clean_result = raw_result.strip().upper()
+                    failure_prefixes = (
+                        "FAILED:",
+                        "ERROR:",
+                        "EXCEPTION:",
+                        "CRITICAL FAILURE:",
+                        "CRITICAL ERROR:",
+                        "FATAL:",
+                        "ABORT:",
+                        "GIT_CONFLICT:",
+                        "GIT_AUTH_ERROR:",
+                    )
+
+                    # Only treat structured failure prefixes or raised exceptions
+                    # as task failure. This avoids false negatives when the model
+                    # echoes retry instructions containing words like "FAILED".
+                    has_failure_marker = execution_error or clean_result.startswith(failure_prefixes)
                     
                     if has_failure_marker:
                         rprint(f"\n[bold red]✖ Task {i+1} ({task.agent.role}) reported FAILURE on attempt {attempt}.[/bold red]")
                         is_non_blocking_failure = task.agent.role in non_blocking_failure_roles
                         
                         # Check for critical failure markers that warrant early termination
-                        critical_substrings = ["CRITICAL FAILURE", "CRITICAL ERROR", "FATAL", "ABORT"]
-                        is_critical = any(sub in clean_result[:1000] or sub in clean_result[-1000:] for sub in critical_substrings)
+                        critical_prefixes = (
+                            "CRITICAL FAILURE:",
+                            "CRITICAL ERROR:",
+                            "FATAL:",
+                            "ABORT:",
+                        )
+                        is_critical = clean_result.startswith(critical_prefixes)
                         
                         if is_critical:
                             rprint(f"[bold red]⚠ CRITICAL FAILURE DETECTED - Early termination initiated[/bold red]")
@@ -666,7 +688,7 @@ def run(feature_request: str, loop_index: int = 0, workspace_path: str = "/works
                                 if is_non_blocking_failure
                                 else f"[bold red]Final Failure: {task.agent.role}[/bold red]"
                             )
-                            rprint(Panel(result.raw, title=panel_title, border_style=panel_style))
+                            rprint(Panel(raw_result, title=panel_title, border_style=panel_style))
 
                             if is_non_blocking_failure:
                                 rprint(
